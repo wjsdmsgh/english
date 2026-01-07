@@ -34,7 +34,6 @@ def load_db():
             data = json.load(f)
         return data if isinstance(data, dict) else {}
     except Exception:
-        # 깨진 파일이면 백업 후 새로 시작
         try:
             os.rename(DATA_FILE, DATA_FILE + ".broken")
         except Exception:
@@ -47,6 +46,20 @@ def save_db(db: dict):
         json.dump(db, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DATA_FILE)
 
+def ai_korean_mean(word: str) -> str:
+    """AI 뜻 생성(실패하면 빈 문자열)"""
+    try:
+        r = client.responses.create(
+            model=MODEL_NAME,
+            input=(
+                f"영어 단어 '{word}'의 가장 많이 쓰이는 한국어 뜻을 "
+                f"핵심 단어만 / 로 구분해서 알려줘. 불필요한 설명은 빼고 뜻만."
+            ),
+        )
+        return normalize_mean(r.output_text.strip())
+    except Exception:
+        return ""
+
 # ================= 상태 =================
 if "page" not in st.session_state:
     st.session_state.page = "home"
@@ -56,6 +69,16 @@ if "current_session" not in st.session_state:
 
 if "quiz" not in st.session_state:
     st.session_state.quiz = {}
+
+# 단어 추가 2단계 상태
+if "add_step" not in st.session_state:
+    st.session_state.add_step = "WORD"  # WORD -> MEAN
+if "pending_word" not in st.session_state:
+    st.session_state.pending_word = ""
+if "ai_suggest_mean" not in st.session_state:
+    st.session_state.ai_suggest_mean = ""
+if "use_ai_default" not in st.session_state:
+    st.session_state.use_ai_default = True
 
 voca_db = load_db()
 
@@ -110,7 +133,6 @@ def vocab_page():
 
     with colB:
         if st.button("🧹 중복 단어 정리", use_container_width=True):
-            # 같은 단어가 여러 개면 마지막 것만 남김
             seen = {}
             for item in voca_db[session]:
                 seen[norm_word(item.get("word", ""))] = item
@@ -121,76 +143,99 @@ def vocab_page():
 
     st.divider()
 
-    # -------- 단어 추가 --------
-    st.subheader("➕ 단어 추가")
-    with st.form("add_word", clear_on_submit=True):
-        word = st.text_input("영어 단어")
-        mean = st.text_input("뜻 (/로 구분)")
-        use_ai = st.checkbox("AI로 뜻 보강하기", value=True)
-        submitted = st.form_submit_button("추가")
+    # ---------- 단어 추가(2단계: WORD -> MEAN) ----------
+    st.subheader("➕ 단어 추가 (Enter로 진행)")
 
-        if submitted:
-            word = (word or "").strip()
-            mean = (mean or "").strip()
+    # 공통 옵션(AI)
+    st.session_state.use_ai_default = st.checkbox("AI로 뜻 추천 받기", value=st.session_state.use_ai_default)
 
-            if not word:
-                st.warning("영어 단어를 입력해줘.")
-                st.stop()
+    if st.session_state.add_step == "WORD":
+        st.caption("1) 영어 단어를 입력하고 Enter를 누르면 뜻 입력 단계로 넘어가.")
+        with st.form("add_word_step1", clear_on_submit=True):
+            w = st.text_input("영어 단어", key="add_word_input")
+            submitted = st.form_submit_button("다음 (Enter)")
+            if submitted:
+                w = (w or "").strip()
+                if not w:
+                    st.warning("영어 단어를 입력해줘.")
+                    st.stop()
 
-            mean_clean = normalize_mean(mean)
+                st.session_state.pending_word = w
+                st.session_state.ai_suggest_mean = ai_korean_mean(w) if st.session_state.use_ai_default else ""
+                st.session_state.add_step = "MEAN"
+                st.rerun()
 
-            ai_mean_clean = ""
-            if use_ai:
-                try:
-                    r = client.responses.create(
-                        model=MODEL_NAME,
-                        input=f"영어 단어 '{word}'의 가장 많이 쓰이는 한국어 뜻을 핵심 단어만 / 로 구분해서 알려줘. 불필요한 설명은 빼고 뜻만."
+    else:  # MEAN
+        w = st.session_state.pending_word
+        st.caption("2) 한국어 뜻을 입력하고 Enter를 누르면 저장돼.")
+        st.markdown(f"**단어:** {w}")
+
+        if st.session_state.use_ai_default and st.session_state.ai_suggest_mean:
+            st.info(f"AI 추천 뜻: {st.session_state.ai_suggest_mean}")
+
+        with st.form("add_word_step2", clear_on_submit=True):
+            default_mean = st.session_state.ai_suggest_mean or ""
+            m = st.text_input("한국어 뜻 (/로 구분)", value=default_mean, key="add_mean_input")
+            submitted = st.form_submit_button("등록 (Enter)")
+
+            if submitted:
+                m = normalize_mean(m)
+
+                # 중복 단어면 업데이트(뜻 합치기)
+                key = norm_word(w)
+                existing = None
+                for item in voca_db[session]:
+                    if norm_word(item.get("word", "")) == key:
+                        existing = item
+                        break
+
+                if existing:
+                    existing["mean"] = normalize_mean("/".join([existing.get("mean", ""), m]))
+                    existing.setdefault("wrong", 0)
+                    existing.setdefault("correct", 0)
+                    existing["updated_at"] = today()
+                    st.success("이미 있는 단어라서 뜻을 합쳐 업데이트했어!")
+                else:
+                    voca_db[session].append(
+                        {
+                            "word": w,
+                            "mean": m,
+                            "wrong": 0,
+                            "correct": 0,
+                            "created_at": today(),
+                            "updated_at": today(),
+                        }
                     )
-                    ai_mean_clean = normalize_mean(r.output_text.strip())
-                except Exception:
-                    st.warning("AI 뜻 생성에 실패했어. (사용자 입력 뜻으로만 저장할게)")
-                    ai_mean_clean = ""
+                    st.success("등록 완료!")
 
-            merged = normalize_mean("/".join([mean_clean, ai_mean_clean]))
+                save_db(voca_db)
 
-            if not merged:
-                st.warning("뜻이 비어있어. 나중에 수정할 수 있어!")
+                # 단계 초기화
+                st.session_state.add_step = "WORD"
+                st.session_state.pending_word = ""
+                st.session_state.ai_suggest_mean = ""
+                st.session_state.pop("add_word_input", None)
+                st.session_state.pop("add_mean_input", None)
 
-            # 중복 단어면 업데이트
-            key = norm_word(word)
-            existing = None
-            for item in voca_db[session]:
-                if norm_word(item.get("word", "")) == key:
-                    existing = item
-                    break
+                st.rerun()
 
-            if existing:
-                existing["mean"] = normalize_mean("/".join([existing.get("mean", ""), merged]))
-                existing.setdefault("wrong", 0)
-                existing.setdefault("correct", 0)
-                existing["updated_at"] = today()
-                st.success("이미 있는 단어라서 뜻을 합쳐 업데이트했어!")
-            else:
-                voca_db[session].append({
-                    "word": word,
-                    "mean": merged,
-                    "wrong": 0,
-                    "correct": 0,
-                    "created_at": today(),
-                    "updated_at": today(),
-                })
-                st.success("추가 완료!")
-
-            save_db(voca_db)
+        # 취소 버튼
+        if st.button("취소", use_container_width=True):
+            st.session_state.add_step = "WORD"
+            st.session_state.pending_word = ""
+            st.session_state.ai_suggest_mean = ""
+            st.session_state.pop("add_word_input", None)
+            st.session_state.pop("add_mean_input", None)
             st.rerun()
 
     st.divider()
+
+    # ---------- 단어 목록 ----------
     st.subheader("📋 단어 목록")
 
     if not voca_db[session]:
         st.info("아직 단어가 없어. 위에서 추가해줘!")
 
-    # 단어 목록: 수정/삭제
     for i, item in enumerate(list(voca_db[session])):  # 안전하게 복사
         word = item.get("word", "")
         mean_val = item.get("mean", "")
@@ -202,11 +247,7 @@ def vocab_page():
             st.caption(f"오답: {item.get('wrong', 0)}")
 
         with c2:
-            new_mean = st.text_input(
-                "뜻",
-                value=mean_val,
-                key=f"mean_{session}_{i}"
-            )
+            new_mean = st.text_input("뜻", value=mean_val, key=f"mean_{session}_{i}")
             new_mean_norm = normalize_mean(new_mean)
             if new_mean_norm != normalize_mean(mean_val):
                 item["mean"] = new_mean_norm
@@ -221,6 +262,7 @@ def vocab_page():
 
     st.divider()
 
+    # ---------- 퀴즈 시작 ----------
     if st.button("▶ 퀴즈 시작", use_container_width=True):
         quiz_list = sorted(voca_db[session], key=lambda x: -(x.get("wrong", 0)))
         st.session_state.quiz = {
@@ -232,7 +274,6 @@ def vocab_page():
             "dir": None,           # 아직 선택 안 함
             "phase": "SETUP",      # SETUP -> RUN -> END
             "last_result": None,   # {"ok": bool, "answers": [...]}
-            "last_answer": ""      # 직전 입력값
         }
         st.session_state.page = "quiz"
         st.rerun()
@@ -261,7 +302,7 @@ def quiz_page():
             "어떤 방식으로 풀래?",
             ["영어 → 한국어", "한국어 → 영어"],
             index=0,
-            horizontal=True
+            horizontal=True,
         )
         if st.button("시작하기 ▶", use_container_width=True):
             qz["dir"] = "EN_KO" if mode == "영어 → 한국어" else "KO_EN"
@@ -271,14 +312,14 @@ def quiz_page():
             qz["correct"] = 0
             qz["wrong"] = []
             qz["last_result"] = None
-            qz["last_answer"] = ""
+            st.session_state.quiz = qz
             st.rerun()
         return
 
     # (2) 결과 화면
     if qz.get("phase") == "END":
         total = len(qz.get("list", []))
-        correct = qz.get("correct", 0)
+        correct = int(qz.get("correct", 0))
         acc = (correct / total * 100) if total else 0
 
         st.subheader("🏁 퀴즈 종료")
@@ -295,50 +336,55 @@ def quiz_page():
                 qz["state"] = "CHECK"
                 qz["phase"] = "RUN"
                 qz["last_result"] = None
-                qz["last_answer"] = ""
+                st.session_state.quiz = qz
                 st.rerun()
         with col2:
             if st.button("🔁 다시 설정하고 시작", use_container_width=True):
                 qz["phase"] = "SETUP"
                 qz["dir"] = None
+                st.session_state.quiz = qz
                 st.rerun()
         return
 
     # (3) 문제 풀이 RUN
-    idx = qz.get("idx", 0)
+    idx = int(qz.get("idx", 0))
     if idx >= len(lst):
         qz["phase"] = "END"
+        st.session_state.quiz = qz
         st.rerun()
 
     q = lst[idx]
     direction = qz.get("dir", "EN_KO")
+    state = qz.get("state", "CHECK")
 
     st.write(f"**{idx + 1} / {len(lst)}**")
 
     question_text = q.get("word", "") if direction == "EN_KO" else q.get("mean", "")
     st.subheader(question_text)
 
-    # 직전 결과 표시
+    # 직전 결과 표시(정답 확인 후)
     last = qz.get("last_result")
-    if last and qz.get("state") == "NEXT":
+    if last and state == "NEXT":
         if last["ok"]:
             st.success("정답 ✅")
         else:
             st.error("오답 ❌")
             st.caption(f"정답: {', '.join(last['answers'])}")
-
         if idx == len(lst) - 1:
-            st.info("엔터(제출)를 한 번 더 누르면 결과가 나와!")
+            st.info("Enter 한 번 더 누르면 결과가 나와!")
 
-    # Enter 제출을 위해 form 사용
-    form_key = f"answer_form_{idx}_{qz.get('state')}"
+    # Enter 제출: 한 폼으로 통일
+    submit_label = "정답 확인 (Enter)" if state == "CHECK" else "다음 (Enter)"
+    form_key = f"answer_form_{idx}"   # 고정
+    input_key = f"ans_{idx}"
+
     with st.form(form_key, clear_on_submit=False):
-        ans = st.text_input("정답 입력 (엔터로 제출)", value="", key=f"ans_{idx}")
-        submitted = st.form_submit_button("제출 (Enter)")
+        ans = st.text_input("정답 입력", key=input_key)
+        submitted = st.form_submit_button(submit_label)
 
         if submitted:
             # CHECK: 정답 확인
-            if qz["state"] == "CHECK":
+            if state == "CHECK":
                 user = (ans or "").strip()
 
                 if direction == "EN_KO":
@@ -346,32 +392,35 @@ def quiz_page():
                     ok = user in answers
                 else:
                     answers = [(q.get("word", "") or "").strip()]
-                    ok = user.lower() == answers[0].lower()
+                    ok = norm_word(user) == norm_word(answers[0])
 
                 if ok:
-                    qz["correct"] += 1
+                    qz["correct"] = int(qz.get("correct", 0)) + 1
                 else:
                     q["wrong"] = int(q.get("wrong", 0)) + 1
                     if q not in qz["wrong"]:
                         qz["wrong"].append(q)
+                    save_db(voca_db)
 
                 qz["last_result"] = {"ok": ok, "answers": answers}
-                qz["last_answer"] = user
                 qz["state"] = "NEXT"
-
-                save_db(voca_db)
+                st.session_state.quiz = qz
                 st.rerun()
 
-            # NEXT: 다음(또는 결과)
+            # NEXT: 다음 / 결과
             else:
+                # 입력칸 꼬임 방지(현재 문제 input key 제거)
+                st.session_state.pop(input_key, None)
+
                 if idx == len(lst) - 1:
                     qz["phase"] = "END"
+                    st.session_state.quiz = qz
                     st.rerun()
 
-                qz["idx"] += 1
+                qz["idx"] = idx + 1
                 qz["state"] = "CHECK"
                 qz["last_result"] = None
-                qz["last_answer"] = ""
+                st.session_state.quiz = qz
                 st.rerun()
 
 # ================= 실행 =================
